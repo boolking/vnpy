@@ -13,6 +13,8 @@ from enum import Enum
 from threading import Lock
 import base64
 
+import logging
+
 from vnpy.api.rest import RestClient, Request
 from vnpy.api.websocket import WebsocketClient
 from vnpy.trader.constant import (
@@ -204,6 +206,7 @@ class KrakenRestApi(RestClient):
         self.gateway_name = gateway.gateway_name
 
         self.trade_ws_api = self.gateway.trade_ws_api
+        self.order_manager = gateway.order_manager
 
         self.key = ""
         self.secret = ""
@@ -214,6 +217,8 @@ class KrakenRestApi(RestClient):
         self.order_count = 1_000_000
         self.order_count_lock = Lock()
         self.connect_time = 0
+
+        self.logger = logging.getLogger('KrakenRestApi')
 
     def _sign(self, data, urlpath):
         """ Sign request data according to Kraken's scheme.
@@ -354,8 +359,8 @@ class KrakenRestApi(RestClient):
             "ordertype": ORDERTYPE_VT2KRAKEN[req.type],
             "price": str(req.price),
             "volume": str(req.volume),
-            "userref": orderid,
-            "validate": false
+            "userref": int(local_orderid),
+            "Validate": False
         }
 
         self.add_request(
@@ -376,7 +381,7 @@ class KrakenRestApi(RestClient):
         sys_orderid = self.order_manager.get_sys_orderid(req.orderid)
 
         data = {
-            "security": Security.SIGNED,
+            "security": Security.PRIVATE,
 
             "txid": sys_orderid
         }
@@ -384,6 +389,7 @@ class KrakenRestApi(RestClient):
             method="POST",
             path="/0/private/CancelOrder",
             callback=self.on_cancel_order,
+            data=data,
             extra=req
         )
 
@@ -427,6 +433,9 @@ class KrakenRestApi(RestClient):
             return
 
         for id, d in data['result']['open'].items():
+            sys_orderid = id
+            local_orderid = self.order_manager.get_local_orderid(sys_orderid)
+
             dt = datetime.fromtimestamp(float(d["opentm"]))
             time = dt.strftime("%Y-%m-%d %H:%M:%S")
             status = d["status"]
@@ -434,7 +443,7 @@ class KrakenRestApi(RestClient):
                 status = "partial"
 
             order = OrderData(
-                orderid=d["refid"],
+                orderid=local_orderid,
                 symbol=d["descr"]["pair"],
                 exchange=Exchange.KRAKEN,
                 price=float(d["descr"]["price"]),
@@ -446,7 +455,7 @@ class KrakenRestApi(RestClient):
                 time=time,
                 gateway_name=self.gateway_name,
             )
-            self.gateway.on_order(order)
+            self.order_manager.on_order(order)
 
         self.gateway.write_log("委托信息查询成功")
 
@@ -490,8 +499,14 @@ class KrakenRestApi(RestClient):
             self.order_manager.on_order(order)
             return
 
-        sys_orderid = data["result"]["txid"]
-        self.order_manager.update_orderid_map(order.orderid, sys_orderid)
+        if data.get("result") and data["result"].get("txid"):
+            sys_orderid = data["result"]["txid"][0]
+            self.order_manager.update_orderid_map(order.orderid, sys_orderid)
+            self.order_manager.add_push_data(sys_orderid, order)
+        else:
+            order.status = Status.REJECTED
+            self.order_manager.on_order(order)
+
 
     def on_send_order_failed(self, status_code: str, request: Request):
         """
@@ -679,7 +694,7 @@ class KrakenTradeWebsocketApi(WebsocketClient):
             for sys_orderid, o in o1.items():
                 order = self.order_manager.get_order_with_sys_orderid(sys_orderid)
                 if not order:
-                    self.order_manager.add_push_data(sys_orderid, data)
+                    self.order_manager.add_push_data(sys_orderid, order)
                     continue
 
                 if o.get("descr"):
@@ -687,7 +702,7 @@ class KrakenTradeWebsocketApi(WebsocketClient):
                     dt = datetime.fromtimestamp(float(o["opentm"]))
                     time = dt.strftime("%Y-%m-%d %H:%M:%S")
 
-                    order.traded = o["vol_exec"]
+                    order.traded = float(o["vol_exec"])
                     order.time = time
 
                 order.status = STATUS_KRAKEN2VT.get(o["status"])
@@ -758,14 +773,14 @@ class KrakenDepth:
                 self.asks = [x for x in self.asks if x.price != n.price]
                 if float(n.vol) != 0:
                     self.asks.append(n)
-            self.asks = sorted(self.asks, key=lambda x: x.price, reverse=True)
+            self.asks = sorted(self.asks, key=lambda x: x.price, reverse=False)
             self.asks = self.asks[:9]
         if b:
             for n in self._price_map(b):
                 self.bids = [x for x in self.bids if x.price != n.price]
                 if float(n.vol) != 0:
                     self.bids.append(n)
-            self.bids = sorted(self.bids, key=lambda x: x.price, reverse=False)
+            self.bids = sorted(self.bids, key=lambda x: x.price, reverse=True)
             self.bids = self.bids[:9]
 
     def to_tick(self, tick):
@@ -883,5 +898,5 @@ class KrakenMarketWebsocketApi(WebsocketClient):
 
             d.to_tick(tick)
 
-        if tick.last_price:
+        if tick.last_price and tick.ask_price_1 and tick.bid_price_1:
             self.gateway.on_tick(copy(tick))
